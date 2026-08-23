@@ -1,0 +1,16 @@
+# Host-side deps for tools/imu_viewer.py.
+#
+# The venv lives OUTSIDE OneDrive (C:\Users\limin\.venvs\flare-imu) so the
+# package tree is not sync'd, and is built from PlatformIO's bundled Python:
+#
+#   & "$env:USERPROFILE\.platformio\python3\python.exe" -m venv "$env:USERPROFILE\.venvs\flare-imu"
+#   & "$env:USERPROFILE\.venvs\flare-imu\Scripts\python.exe" -m pip install -r tools\requirements.txt
+
+pyserial
+numpy
+matplotlib
+
+# That Python ships without tkinter, so matplotlib has no GUI toolkit to fall
+# back on and silently degrades to the file-only 'agg' backend. PySide6 supplies
+# the QtAgg backend. Required for the live window; not needed for --selftest.
+pyside6

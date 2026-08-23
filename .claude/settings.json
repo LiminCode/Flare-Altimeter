@@ -1,0 +1,23 @@
+{
+  "sandbox": {
+    "enabled": false,
+    "failIfUnavailable": false
+  },
+  "permissions": {
+    "allow": [
+      "Bash(ls -la \"c:/Users/limin/WorkSpace/AI/\" 2>&1 | head -30)",
+      "Read(//c/Users/limin/WorkSpace/AI/**)",
+      "Bash(ls -la \"c:/Users/limin/WorkSpace/AI/flare-altimeter\" 2>&1)",
+      "Read(//c/Users/limin/WorkSpace/AI/flare-altimeter/**)",
+      "PowerShell($env:PATH += \";$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\"; pio pkg search \"BNO08x\" 2>&1 | Select-Object -First 40)",
+      "PowerShell($env:PATH += \";$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\"; pio pkg install 2>&1 | Select-Object -Last 20)",
+      "PowerShell($env:PATH += \";$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\"; pio run 2>&1 | Select-Object -Last 25)",
+      "PowerShell($env:PATH += \";$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\"; pio run -d \"C:\\\\Users\\\\limin\\\\OneDrive\\\\Documents\\\\PlatformIO\\\\Projects\\\\flare-altimeter\" -t upload 2>&1 | Select-Object -Last 12)",
+      "Bash(ls -la \"c:/Users/limin/WorkSpace/AI/\" | grep -i flare; echo \"--- folder ---\"; ls -la \"c:/Users/limin/WorkSpace/AI/flare-altimeter/\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\limin\\WorkSpace\\AI",
+      "c:\\Users\\limin\\.claude\\projects\\c--Users-limin-OneDrive-Documents-PlatformIO-Projects-flare-altimeter\\memory"
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+.pio
+.vscode/.browse.c_cpp.db*
+.vscode/c_cpp_properties.json
+.vscode/launch.json
+.vscode/ipch
+
+# Host-side tooling
+__pycache__/
+*.pyc
+
+# Generated mock descents. The generator is committed, the output is not: the
+# files are reproducible from tools/make_mock_descent.py with a fixed seed, and
+# a committed copy would be one more thing that can silently disagree with the
+# code that makes it.
+# 中文：mock 数据不入库，只提交生成它的脚本。种子是固定的，随时可以复现；
+#       而入库一份副本，就是多了一样会和生成它的代码悄悄对不上的东西。
+tools/mock/
