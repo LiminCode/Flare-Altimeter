@@ -11,38 +11,11 @@
 namespace hw {
 namespace {
 
-// Every GPIO that can be probed without breaking the running system.
-//
-// Excluded on purpose, and they are the blind spot if a wire seems to vanish:
-//   26-37  octal PSRAM + quad flash -- touching these crashes the chip
-//   43/44  UART0 to the CH340, i.e. this very console
-//   19/20  native USB D-/D+ -- see below
-// Strapping pins (0/3/45/46) ARE probed: they only matter at boot, so reading
-// them at runtime is harmless.
-//
-// GPIO19/20 are NOT harmless, which cost a long detour. They are the USB PHY
-// pads, and pinMode(20, INPUT_PULLDOWN) reaches gpio_ll_pullup_dis(), which
-// special-cases D+ and clears USB_SERIAL_JTAG_DP_PULLUP behind a latching
-// PAD_PULL_OVERRIDE. That pull-up is the signal telling the host a device is
-// attached, so probing the pin electrically unplugs the board mid-enumeration --
-// Windows reports "Device Descriptor Request Failed" and the port never returns
-// until a chip reset. Probing them is a one-way trip.
-//
-// 中文说明（这段是踩过坑换来的，改之前务必读完）：
-//   GPIO19/20 曾经被放进这个「安全探测」列表，理由是「原生 USB 没用到，
-//   运行时读一下总没事吧」。这个判断错了，而且错得很隐蔽：
-//     1. 它们不是普通 IO，是 USB PHY 的引脚，GPIO20 = USB D+。
-//     2. pinMode(pin, INPUT_PULLDOWN) 设下拉必先关上拉，进到 IDF 的
-//        gpio_ll_pullup_dis()，那个函数对 D+ 有特判：置位 PAD_PULL_OVERRIDE
-//        并清掉 DP_PULLUP。
-//     3. D+ 上这个上拉电阻正是 USB 协议里「有设备接上来了」的电信号。
-//        清掉它 = 在电气层面把板子从 USB 总线上拔下来。
-//     4. PAD_PULL_OVERRIDE 是锁存的，一旦置位不会自己恢复，必须复位芯片。
-//   表现出来是：插线 -> 正常枚举 -> 约 300 ms 后固件启动跑探测 -> 端口消失。
-//   这曾被误判成「这块板的原生 USB 口是坏的」，其实是固件自己打死的。
-const uint8_t SAFE_GPIOS[] = {0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10,
-                              11, 12, 13, 14, 15, 16, 17, 18, 21,
-                              38, 39, 40, 41, 42, 45, 46, 47, 48};
+// The probe list lives in pins.h (PROBE_GPIOS) because it is a property of the
+// board, and so is the list of pins that must never be touched -- including the
+// GPIO19/20 USB trap, documented there.
+// 中文：哪些脚能探、哪些脚碰不得，是「板子」的属性而不是诊断代码的属性，
+//       所以列表和那段 GPIO19/20 的血泪史一起搬到了 pins.h。
 
 // Pins with onboard circuitry that reads like an external connection. Naming them
 // keeps a false positive from sending us down the wrong path.
@@ -197,8 +170,8 @@ void i2cReattach() {
 void probeLines() {
   Out.println(F("--- line probe ---"));
   int interesting = 0;
-  for (uint8_t i = 0; i < sizeof(SAFE_GPIOS); i++) {
-    const uint8_t pin = SAFE_GPIOS[i];
+  for (uint8_t i = 0; i < sizeof(PROBE_GPIOS); i++) {
+    const uint8_t pin = PROBE_GPIOS[i];
     const LineState s = classifyLine(pin);
     const bool isImuPin = (pin == PIN_SDA || pin == PIN_SCL || pin == PIN_RST);
     const bool isLidarPin = (pin == PIN_LIDAR_RX || pin == PIN_LIDAR_TX);
@@ -220,9 +193,7 @@ void probeLines() {
     Out.println(F("  check VCC->3V3 and GND->GND first, nothing else matters yet."));
   }
   Out.printf("--- %d non-floating pin(s) ---\n", interesting);
-  Out.println(F("  (GPIO26-37 = flash/PSRAM, GPIO43/44 = this console, and"
-                " GPIO19/20 = USB D-/D+ cannot be probed"));
-  Out.println(F("   -- a wire on any of those is invisible here)"));
+  Out.println(F(PROBE_EXCLUDED_NOTE));
 
   // The probe just stole every one of these from its peripheral.
   i2cReattach();

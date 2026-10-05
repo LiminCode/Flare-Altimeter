@@ -16,6 +16,42 @@ uint8_t address = 0;
 bool ready = false;
 uint8_t accuracy = 0;
 
+// Whether the SH-2 stack below the SparkFun wrapper currently holds its one
+// transport instance. See releaseStack().
+bool stackOpen = false;
+
+// The SparkFun wrapper never closes what it opens. Its begin() calls sh2_open(),
+// which takes the single SHTP instance (MAX_INSTANCES is 1 in shtp.c), and
+// nothing hands it back -- so the second begin() of a process gets no instance,
+// shtp_open() returns 0, sh2_open() fails, and begin() reports "no response"
+// for a chip that is sitting right there ACKing its address. First connect works,
+// every reconnect fails. Found 2026-10-03 on the XIAO: boot OK, every 'r' after
+// it 0 for 3. sh2_close() returns the instance. It must only be called once the
+// stack really was opened: with nothing open it dereferences a null transport.
+//
+// 中文说明（重连为什么必失败）：
+//   SparkFun 这个库只开不关。begin() 里的 sh2_open() 会占用 SHTP 层**唯一**的
+//   实例（shtp.c 里 MAX_INSTANCES = 1），之后没有任何地方归还。于是同一次运行里
+//   第二次 begin()：拿不到实例 -> shtp_open() 返回 0 -> sh2_open() 失败 ->
+//   begin() 报「没响应」—— 而芯片明明就在总线上应答地址。
+//   表现就是开机那次能连，之后按 'r' 重扫一次都连不上（实测 3/3 失败）。
+//   sh2_close() 把实例还回去。但只能在确实开过之后调用：没开过就调用，
+//   它会解引用一个空的传输层指针，直接崩。
+void releaseStack() {
+  if (!stackOpen) return;
+  sh2_close();
+  stackOpen = false;
+}
+
+// begin() only reaches sh2_open() if the address ACKs; mirror that test so
+// stackOpen tracks the truth even when begin() fails halfway.
+// 中文：begin() 只有在地址应答之后才会走到 sh2_open()，这里做同样的判断，
+//       保证 begin() 中途失败时 stackOpen 依然反映真实状态。
+bool addressAcks(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
 // Pulse the reset line. The BNO08x is much happier after a clean hardware reset
 // than after a bare power-on, especially on breakout wiring.
 //
@@ -47,6 +83,8 @@ bool imuStart(uint8_t hintAddress) {
   for (uint8_t attempt = 0; attempt < 2; attempt++) {
     const uint8_t addr = candidates[attempt];
     Out.printf("BNO08x: trying 0x%02X ... ", addr);
+    releaseStack();
+    if (addressAcks(addr)) stackOpen = true;
     if (imu.begin(addr, Wire)) {
       Out.println(F("OK"));
       address = addr;

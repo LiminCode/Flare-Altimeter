@@ -56,6 +56,14 @@ float tiltFromVerticalDeg(const Quat &q) {
 
 float heightFromSlantCm(int32_t distCm, float tiltDeg) {
   if (distCm < 0) return -1.0f;
+  // At 90 deg the beam is horizontal and cos() says h = 0, "on the ground"; past
+  // it the beam points up and h goes negative. Neither is a height. Seen
+  // 2026-10-03 with no mounting reference stored: a replayed 20 m descent came
+  // out as -1.27 m .. -0.01 m.
+  // 中文：90° 时光束水平，cos 给出 h = 0，即「已经贴地」；超过 90° 光束朝上，
+  //       h 变成负数。两者都不是高度。2026-10-03 没存安装基准时实测：
+  //       回放一段 20 米下降，算出来的高度是 -1.27 m 到 -0.01 m。
+  if (tiltDeg >= 90.0f) return -1.0f;
   return (float)distCm * cosf(tiltDeg / kRadToDeg);
 }
 

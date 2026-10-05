@@ -124,6 +124,17 @@ void test_no_reading_stays_negative_never_zero() {
   TEST_ASSERT_FLOAT_WITHIN(0.001f, -1.0f, flare::heightFromSlantCm(-1, 35.0f));
 }
 
+void test_beam_level_or_upward_is_no_reading() {
+  // cos(90) = 0 would read as "on the ground"; past 90 the height goes negative.
+  // The measured case: a 20 m replay with the IMU on its side came out at -1.27 m.
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, -1.0f, flare::heightFromSlantCm(1000, 90.0f));
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, -1.0f, flare::heightFromSlantCm(2000, 93.6f));
+  TEST_ASSERT_FLOAT_WITHIN(0.001f, -1.0f, flare::heightFromSlantCm(2000, 180.0f));
+  // Just short of horizontal is still a (tiny) height; the 40 deg gate, not this
+  // function, is what keeps it away from the alarm.
+  TEST_ASSERT_TRUE(flare::heightFromSlantCm(1000, 89.0f) > 0.0f);
+}
+
 // --- euler -----------------------------------------------------------------
 
 void test_rpy_of_identity_is_all_zero() {
@@ -153,6 +164,7 @@ int main(int, char **) {
   RUN_TEST(test_quat_times_its_conjugate_is_identity);
   RUN_TEST(test_height_equals_distance_when_level);
   RUN_TEST(test_height_applies_cosine);
+  RUN_TEST(test_beam_level_or_upward_is_no_reading);
   RUN_TEST(test_no_reading_stays_negative_never_zero);
   RUN_TEST(test_rpy_of_identity_is_all_zero);
   RUN_TEST(test_rpy_recovers_a_pure_roll);

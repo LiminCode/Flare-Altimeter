@@ -43,6 +43,7 @@ float tiltFromVerticalDeg(const Quat &q);
 
 // Slant range -> vertical height. Returns -1 for "no reading", never 0: downstream,
 // 0 means "on the ground", which is the most dangerous possible default.
+// A beam at or above horizontal (tilt >= 90 deg) is also "no reading".
 // 中文：斜距换算竖直高度。没有读数时返回 -1 而不是 0 ——
 //       下游把 0 理解成「已经贴地」，那是最危险的默认值。
 float heightFromSlantCm(int32_t distCm, float tiltDeg);

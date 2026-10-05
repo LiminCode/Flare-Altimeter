@@ -58,6 +58,14 @@ uint8_t imuHintAddress = 0;
 // Latest attitude/height, refreshed at sensor rate rather than print rate.
 flare::Quat attitude{1.0f, 0.0f, 0.0f, 0.0f};
 uint8_t fusionAccuracy = 0;
+
+// Measured IMU report rate, not the configured one. A rate that is configured but
+// not achieved is the quiet way an I2C bus tells you it is saturated.
+// 中文：实测到的 IMU 报告频率，不是配置值。配置了却达不到，是 I2C 总线饱和
+//       最安静的表现形式，所以要数真实到达的报告。
+uint16_t imuHz = 0;
+uint16_t imuReportsThisSec = 0;
+uint32_t imuRateWindowMs = 0;
 float tiltDeg = 0.0f;
 float heightCm = -1.0f;
 int32_t distCm = -1;
@@ -79,7 +87,9 @@ void runDiagnostics() {
                IMU_REPORT_INTERVAL_MS);
     Out.println(F("Rotate the board slowly on all 3 axes to settle the fusion.\n"));
   } else {
-    Out.println(F("\nIMU not found. Fix wiring; retrying every 2 s (or press 'r').\n"));
+    Out.println(F("\nIMU not found -- running LASER-ONLY: tilt = 0, no correction."));
+    Out.println(F("Retrying every 2 s until the laser comes online; after that,"
+                  " press 'r' to rescan.\n"));
   }
 }
 
@@ -89,10 +99,14 @@ void printStatus() {
              settings::s.refStored ? "stored" : "none",
              settings::s.tiltCorrection ? "on" : "OFF",
              hw::buzzMuted() ? "muted" : "unmuted");
-  Out.printf("         alert: %s   armed: %s   h=%.1f cm (%s)   fusion acc=%u\n",
+  Out.printf("         alert: %s   armed: %s   h=%.1f cm (%s)   IMU: %s\n",
              flare::stageName(alerts.stage()), alerts.armed() ? "YES" : "no",
              heightCm, distCm >= 0 ? "valid" : "no valid height",
-             hw::imuAccuracy());
+             hw::imuReady() ? "present" : "ABSENT (laser-only)");
+  if (hw::imuReady()) {
+    Out.printf("         fusion acc=%u   reports: %u Hz measured (%u Hz requested)\n",
+               hw::imuAccuracy(), imuHz, 1000u / IMU_REPORT_INTERVAL_MS);
+  }
   Out.printf("         beep every %.0f cm, %u->%u Hz over %.0f..%.0f cm;"
              " continuous below %.0f cm; auto-stop %.0f s under %.0f cm\n",
              cfg.beepStepCm, cfg.pitchLowHz, cfg.pitchHighHz, cfg.alertTopCm,
@@ -297,7 +311,7 @@ void drawGauge(char *buf, size_t len, float value, float fullScale) {
 void setup() {
   Out.begin(115200);
   delay(300);
-  Out.println(F("\n\n=== Flare Altimeter :: IMU bring-up ==="));
+  Out.println(F("\n\n=== Flare Altimeter :: " FLARE_BOARD_NAME " ==="));
 
   hw::i2cBegin();
   hw::lidarBegin();
@@ -331,7 +345,26 @@ void loop() {
       attitude = q;
       fusionAccuracy = acc;
       tiltDeg = flare::tiltFromVerticalDeg(q);
+      imuReportsThisSec++;
     }
+    if (now - imuRateWindowMs >= 1000) {
+      imuHz = imuReportsThisSec;
+      imuReportsThisSec = 0;
+      imuRateWindowMs = now;
+    }
+  } else {
+    // Drop the attitude the moment the IMU is gone. Found 2026-10-03: the IMU
+    // connected at boot, read the module lying on its side (tilt ~80 deg), then a
+    // rescan failed to reconnect it -- and the console printed "tilt taken as 0"
+    // while h was still 194 cm x cos(80) = 35 cm. A number that outlives its
+    // sensor is exactly the kind of plausible-looking lie this project refuses.
+    // 中文：IMU 一掉线立刻清掉姿态。2026-10-03 实测：开机时 IMU 连上了，读到模块
+    //       侧躺着（倾角约 80°），之后一次重扫没连上 —— 屏幕上写着「倾角按 0 算」，
+    //       高度却仍是 194 cm × cos 80° = 35 cm。活得比传感器还久的数字，
+    //       正是这个项目最不能容忍的那种「看着合理的谎话」。
+    attitude = {1.0f, 0.0f, 0.0f, 0.0f};
+    fusionAccuracy = 0;
+    tiltDeg = 0.0f;
   }
 
   // A stale reading is worse than none: report -1 once the stream stops rather
@@ -343,8 +376,16 @@ void loop() {
   // Alert input: the simulator when it is running, the sensors otherwise. The
   // validity gate is the project's -- no echo, or a beam more than 40 deg off
   // vertical, means there is no height this frame.
+  //
+  // The IMU is optional. Without it tiltDeg stays at 0, so the slant range is
+  // taken as the height and the tilt gate never trips. That is a real loss of
+  // accuracy on a swinging foot (the spec calls tilt correction required), but it
+  // lets the laser and the alert ladder be brought up and tested on their own.
+  // 中文：IMU 可以不接。不接时 tiltDeg 恒为 0：斜距直接当高度用，倾角判据永远不触发。
+  //       在摆动的脚上这是实打实的精度损失（规格书写明倾角修正是必需的），
+  //       但它让激光和响声阶梯可以单独先调通、先测试。
   float alertHeight = heightCm;
-  bool alertValid = hw::imuReady() && distCm >= 0 &&
+  bool alertValid = distCm >= 0 &&
                     (!settings::s.tiltCorrection || tiltDeg <= TILT_GATE_DEG);
   const bool simRunning = sim::update(now, alertHeight, alertValid);
 
@@ -380,7 +421,17 @@ void loop() {
     }
   }
 
-  if (!hw::imuReady()) {
+  // No IMU and no laser: nothing is wired yet, so keep running the full
+  // diagnostics -- that is the wiring-stage loop and it is what found the TF02
+  // power fault. Once the laser is streaming, stop: imuStart() blocks for ~0.8 s
+  // of reset pulses, which at 100 Hz would drop a burst of laser frames every
+  // retry, and a deliberately laser-only setup would never stop being
+  // interrupted. 'r' rescans on demand.
+  // 中文：IMU 和激光都没有 = 还在接线阶段，照旧每 2 s 跑一遍完整诊断。
+  //       激光一旦出数据就停下来：imuStart() 的复位脉冲要阻塞约 0.8 s，
+  //       100 Hz 下每次重试都会丢一串激光帧，而故意只接激光的场合会被无休止地打断。
+  //       需要时按 'r' 手动重扫。
+  if (!hw::imuReady() && !hw::lidarOnline()) {
     static uint32_t lastRetry = 0;
     if (now - lastRetry > 2000) {
       lastRetry = now;
@@ -405,13 +456,17 @@ void loop() {
                hw::lidarOnline() ? hw::lidarStrength() : 0, heightCm,
                settings::s.tiltCorrection ? 1u : 0u, (unsigned)out.stage);
   } else {
-    static const char *accName[4] = {"unreliable", "low", "medium", "high"};
-    char rollBar[24], pitchBar[24];
-    drawGauge(rollBar, sizeof(rollBar), roll, 90.0f);
-    drawGauge(pitchBar, sizeof(pitchBar), pitch, 90.0f);
-    Out.printf("R%+7.1f %s  P%+7.1f %s  Y%+7.1f  tilt%6.1f  [%s]\n", roll,
-               rollBar, pitch, pitchBar, yaw, tiltDeg,
-               accName[fusionAccuracy & 0x03]);
+    if (hw::imuReady()) {
+      static const char *accName[4] = {"unreliable", "low", "medium", "high"};
+      char rollBar[24], pitchBar[24];
+      drawGauge(rollBar, sizeof(rollBar), roll, 90.0f);
+      drawGauge(pitchBar, sizeof(pitchBar), pitch, 90.0f);
+      Out.printf("R%+7.1f %s  P%+7.1f %s  Y%+7.1f  tilt%6.1f  [%s %uHz]\n", roll,
+                 rollBar, pitch, pitchBar, yaw, tiltDeg,
+                 accName[fusionAccuracy & 0x03], imuHz);
+    } else {
+      Out.println(F("IMU absent -- laser-only, tilt taken as 0"));
+    }
     if (distCm < 0) {
       Out.printf("    laser: %s\n",
                  hw::lidarOnline() ? "no valid echo" : "OFFLINE (no frames)");
