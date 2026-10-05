@@ -1,0 +1,8 @@
+# Normalise text to LF in the repository; Windows checkouts may still use CRLF.
+* text=auto
+
+# Shell scripts run under WSL/bash, which rejects CRLF ("$'\r': command not found").
+*.sh text eol=lf
+
+# Binary assets.
+*.png binary
