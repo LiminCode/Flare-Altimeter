@@ -21,7 +21,7 @@ OUT="$ROOT/.pio/native_tests"
 
 if [[ ! -f "$UNITY/unity.c" ]]; then
   echo "Unity source not found at $UNITY"
-  echo "Run 'pio test -e native' once on any machine to vendor it, then retry."
+  echo "Run 'pio pkg install -e native' once to vendor it (needs no host compiler), then retry."
   exit 1
 fi
 

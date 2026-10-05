@@ -256,64 +256,107 @@ def serial_reader(port: str, baud: int, buf: SampleBuffer, stop: threading.Event
     #   因为它看起来完全像是固件不出声，而不像是上位机把板子搞停了。
     #   所以这里必须先建对象、把 dtr/rts 设成 False，再 open()，
     #   不能用 serial.Serial(port, baud) 这种「构造即打开」的写法。
-    ser = serial.Serial()
-    ser.port = port
-    ser.baudrate = baud
-    ser.timeout = 1
-    ser.dtr = False
-    ser.rts = False
-    try:
+    def open_port():
+        ser = serial.Serial()
+        ser.port = port
+        ser.baudrate = baud
+        ser.timeout = 1
+        ser.dtr = False
+        ser.rts = False
         ser.open()
-    except Exception as exc:
-        # A busy port is the single most common way to start this tool wrong, and
-        # raising inside a thread turns that into a wall of traceback that buries
-        # the one line explaining it. Say what happened and what to do, then stop
-        # cleanly so the window does not sit there empty pretending to work.
-        # 中文：端口被占是启动这个工具最常见的错误方式，而在线程里抛异常会把
-        #       唯一有用的那句话埋进一屏 traceback。直接说清楚发生了什么、
-        #       该怎么办，然后干净地退出 —— 而不是让窗口空着假装在工作。
-        print(f"[viewer] cannot open {port}: {exc}", file=sys.stderr)
-        print("[viewer] something else holds the port -- another viewer window,"
-              " or 'pio device monitor'. Close it and retry.", file=sys.stderr)
-        stop.set()
-        return
+        return ser
 
-    with ser:
-        time.sleep(0.2)
-        ser.reset_input_buffer()
-        ser.write(b"s\n")            # ask for the firmware's alert configuration
-        ser.write(b"c\n")            # then switch to the CSV stream
-        ser.flush()
-        print(f"[viewer] reading {port} @ {baud}", file=sys.stderr)
-        while not stop.is_set():
-            try:
-                while True:
-                    ser.write(commands.get_nowait())
-                    ser.flush()
-            except queue.Empty:
-                pass
-            try:
-                raw = ser.readline().decode("utf-8", errors="replace")
-            except Exception as exc:                 # unplugged mid-run
-                print(f"[viewer] serial error: {exc}", file=sys.stderr)
-                break
-            if not raw:
-                continue
-            s = parse_line(raw)
-            if s is None:
-                if "beep every" in raw:
-                    parse_fw_config(raw)
-                elif "beep" in raw:
-                    # "  beep    1100 cm   938 Hz   (t+0.44 s)"
-                    parts = raw.split()
+    # Survive the board going away. From the battery stage on, unplugging USB is
+    # routine, and on the XIAO the port itself disappears with the cable. The
+    # first version let the reader thread die on the error, which left the window
+    # up, frozen on the last frame, looking alive. Now it waits for the port to
+    # come back and re-sends the handshake, because a re-plugged board has
+    # rebooted into the human view and will not stream CSV until asked.
+    # 中文说明（为什么要自动重连）：
+    #   从接电池这一步开始，拔插 USB 是家常便饭；XIAO 的串口会随着线一起消失。
+    #   最早的写法遇到串口错误时读线程直接退出，窗口还开着、停在最后一帧，
+    #   看起来像还活着 —— 这比直接报错更糟。现在改为等端口回来并重新握手：
+    #   重新插上的板子已经重启回到了人类可读视图，不再次发 'c' 它不会输出 CSV。
+    first_open = True
+    while not stop.is_set():
+        try:
+            ser = open_port()
+        except Exception as exc:
+            if first_open:
+                # A busy port is the single most common way to start this tool
+                # wrong. Say so plainly and stop, rather than retrying forever
+                # against a port another program holds.
+                # 中文：启动时端口被占是最常见的用法错误。直接说清楚并退出，
+                #       而不是对着一个被别的程序占着的端口无限重试。
+                print(f"[viewer] cannot open {port}: {exc}", file=sys.stderr)
+                print("[viewer] something else holds the port -- another viewer"
+                      " window, or 'pio device monitor'. Close it and retry.",
+                      file=sys.stderr)
+                stop.set()
+                return
+            time.sleep(1.0)
+            continue
+
+        with ser:
+            time.sleep(0.2)
+            ser.reset_input_buffer()
+            ser.write(b"s\n")        # ask for the firmware's alert configuration
+            ser.write(b"c\n")        # then switch to the CSV stream
+            ser.flush()
+            print(f"[viewer] {'reading' if first_open else 'reconnected to'}"
+                  f" {port} @ {baud}", file=sys.stderr)
+            first_open = False
+            last_sample = time.monotonic()
+            last_handshake = last_sample
+            while not stop.is_set():
+                try:
+                    while True:
+                        ser.write(commands.get_nowait())
+                        ser.flush()
+                except queue.Empty:
+                    pass
+                except Exception:
+                    break                            # unplugged while writing
+                try:
+                    raw = ser.readline().decode("utf-8", errors="replace")
+                except Exception as exc:             # unplugged mid-run
+                    print(f"[viewer] lost {port} ({exc.__class__.__name__});"
+                          " waiting for it to come back...", file=sys.stderr)
+                    break
+
+                # Port alive but no CSV for 2 s: the board was reset (EN button,
+                # a flash, a brown-out) and came back in the human view. Ask again.
+                # 中文：端口还在但 2 秒没收到 CSV：板子被复位过（按 EN、刷固件、
+                #       掉电），重启后回到了人类可读视图，重新发一次握手。
+                now = time.monotonic()
+                if now - last_sample > 2.0 and now - last_handshake > 2.0:
                     try:
-                        buf.push_beep(float(parts[1]), int(parts[3]))
-                    except (IndexError, ValueError):
+                        ser.write(b"s\nc\n")
+                        ser.flush()
+                    except Exception:
+                        break
+                    last_handshake = now
+
+                if not raw:
+                    continue
+                s = parse_line(raw)
+                if s is None:
+                    if "beep every" in raw:
+                        parse_fw_config(raw)
+                    elif "beep" in raw:
+                        # "  beep    1100 cm   938 Hz   (t+0.44 s)"
+                        parts = raw.split()
+                        try:
+                            buf.push_beep(float(parts[1]), int(parts[3]))
+                        except (IndexError, ValueError):
+                            buf.dropped += 1
+                    elif raw.strip():
                         buf.dropped += 1
-                elif raw.strip():
-                    buf.dropped += 1
-            else:
-                buf.push(s)
+                else:
+                    last_sample = time.monotonic()
+                    buf.push(s)
+        if not stop.is_set():
+            time.sleep(1.0)
 
 
 def load_mock(path: str) -> tuple[list[tuple[int, int, int]], dict[str, str]]:
@@ -535,97 +578,6 @@ def build_figure():
     return fig, ax3d, axtilt, axdist
 
 
-def _draw_stage_banner(fig, latest: Sample | None):
-    """One big word for what the buzzer is doing right now."""
-    txt = getattr(fig, "_flare_stage_text", None)
-    if txt is None:
-        txt = fig.text(0.72, 0.955, "", ha="center", va="center", fontsize=15,
-                       family="monospace", fontweight="bold")
-        fig._flare_stage_text = txt
-    if latest is None:
-        txt.set_text("alert: --")
-        txt.set_color("#8a8a8a")
-        return
-    stage = max(0, min(len(STAGE_NAMES) - 1, latest.stage))
-    txt.set_text(f"alert: {STAGE_NAMES[stage]}")
-    txt.set_color(STAGE_COLORS[stage])
-
-
-def _draw_3d(ax3d, latest: Sample | None):
-    ax3d.set_xlim(-1.2, 1.2)
-    ax3d.set_ylim(-1.2, 1.2)
-    ax3d.set_zlim(-1.2, 1.2)
-    ax3d.set_box_aspect((1, 1, 1))
-    ax3d.set_xlabel("world X")
-    ax3d.set_ylabel("world Y")
-    ax3d.set_zlabel("world Z (up)")
-
-    # World vertical: theta is measured against this.
-    ax3d.plot([0, 0], [0, 0], [0, 1.15], color="0.6", linestyle=":", linewidth=1)
-
-    if latest is None:
-        ax3d.set_title("waiting for data...")
-        return
-
-    R = quat_to_matrix(*latest.quat)
-    colors = ("#d62728", "#2ca02c", "#1f77b4")     # X red, Y green, Z blue
-    labels = ("+X", "+Y", "+Z")
-    for i in range(3):
-        vx, vy, vz = R[:, i]
-        ax3d.quiver(0, 0, 0, vx, vy, vz, color=colors[i], linewidth=2.5,
-                    arrow_length_ratio=0.15)
-        ax3d.text(vx * 1.18, vy * 1.18, vz * 1.18, labels[i],
-                  color=colors[i], fontsize=9, ha="center")
-
-    # The laser fires along body -Z, so the beam is the +Z axis mirrored. Drawing
-    # it at unit length regardless of the real range keeps the picture in frame
-    # while still being geometrically honest: with |beam| = 1, the height of its
-    # tip below the origin is exactly cos(theta) = h/d. The dashed drop and the
-    # ground plane are then a picture of the correction itself, not a to-scale map.
-    #
-    # 中文说明：
-    #   激光沿模块的 -Z 方向打出去，所以光束就是 +Z 轴取反。
-    #   这里把光束一律画成单位长度而不是按真实距离缩放 —— 否则 5 米的读数会把
-    #   整个图撑爆。而且单位长度反而更能说明问题：光束长度取 1 时，光束末端
-    #   相对原点的垂直落差正好就是 cos(theta)，也就是 h/d 这个比值本身。
-    #   于是那根竖直虚线和底部的地面线，画的就是「斜距换算成高度」这件事，
-    #   而不是一张按比例的实景图。
-    if math.isfinite(latest.dist):
-        bx, by, bz = -R[:, 2]
-        ax3d.quiver(0, 0, 0, bx, by, bz, color="#ff7f0e", linewidth=2.0,
-                    arrow_length_ratio=0.12, linestyle="-")
-        drop = -math.cos(math.radians(latest.tilt))          # tip height = h/d
-        ax3d.plot([bx, bx], [by, by], [bz, drop], color="#ff7f0e",
-                  linestyle=":", linewidth=1.0)
-        ax3d.plot([-1.1, 1.1], [0, 0], [drop, drop], color="0.5",
-                  linestyle="--", linewidth=0.9)
-        ax3d.text(bx * 1.1, by * 1.1, bz * 1.1, "beam", color="#ff7f0e",
-                  fontsize=9, ha="center")
-
-    roll, pitch, yaw = latest.rpy
-    ax3d.set_title(
-        f"tilt theta = {latest.tilt:5.1f}deg    fusion: {ACC_NAMES[latest.acc & 3]}\n"
-        f"roll {roll:+6.1f}  pitch {pitch:+6.1f}  yaw {yaw:+6.1f}",
-        fontsize=10, family="monospace")
-
-
-def _draw_tilt(axtilt, history: list[Sample]):
-    axtilt.set_ylim(0, 180)
-    axtilt.set_ylabel("theta from vertical (deg)")
-    axtilt.grid(alpha=0.3)
-    # Above this the laser points sideways and cos-correction is invalid.
-    axtilt.axhline(TILT_GATE_DEG, color="#d62728", linestyle="--", linewidth=1)
-    axtilt.text(0.01, TILT_GATE_DEG + 3, "40deg reject gate", color="#d62728",
-                fontsize=8, transform=axtilt.get_yaxis_transform())
-
-    if history:
-        t_end = history[-1].t
-        axtilt.plot([s.t - t_end for s in history], [s.tilt for s in history],
-                    color="#1f77b4", linewidth=1.4)
-        axtilt.set_xlim(-TRAIL_SECONDS, 0.5)
-    axtilt.set_title("theta history -- feeds h = d x cos(theta)", fontsize=10)
-
-
 def _range_ylimits(history: list[Sample]) -> tuple[str, float, float]:
     """Pick the y scale for the range panel.
 
@@ -670,89 +622,330 @@ def _range_ylimits(history: list[Sample]) -> tuple[str, float, float]:
     return "linear", 0.0, peak * 1.12
 
 
-def _draw_range(axdist, latest: Sample | None, history: list[Sample]):
-    scale, lo, hi = _range_ylimits(history)
-    axdist.set_yscale(scale)
-    axdist.set_ylim(lo, hi)
-    axdist.set_ylabel("cm" + (" (log)" if scale == "log" else ""))
-    axdist.set_xlabel("seconds")
-    axdist.grid(alpha=0.3, which="both" if scale == "log" else "major")
+class LiveView:
+    """Every artist on the figure, created once and then only updated.
 
-    # The stage boundaries the firmware actually uses (alert_engine stageForHeight).
-    # The old 400/300/200/100 lines drawn here belonged to the retired four-band
-    # ladder and had meant nothing for a while -- a reference line that is wrong is
-    # worse than none, because it invites you to check against it.
-    # 中文：这是固件真正在用的档位边界。原先画的 400/300/200/100 属于早已退役的
-    #       四档模型，有一阵子什么都不代表了 —— 一条画错的参考线比没有更糟，
-    #       因为它会诱使你拿它去核对。
-    for edge in (1000.0, 500.0):
-        axdist.axhline(edge, color="0.75", linestyle=":", linewidth=0.8)
+    The first version of this viewer called ax.clear() on all three panels every
+    frame and drew everything again: quivers, labels, grids, legend, reference
+    lines. Measured 2026-10-03 at 137 ms per frame -- a ceiling of 7 fps, which
+    is what made the 3-D view visibly step while the sensor was being moved.
+    Almost all of that time was spent rebuilding things that never change. Now
+    the static parts (limits, labels, grids, the gate line, the legend) are set
+    up once, and a frame only moves the line data and changes the text.
 
-    # The changeover height is a firmware setting we are not told, so infer it:
-    # the highest height at which the board reported FLARE NOW. Showing the
-    # observed value rather than an assumed one means the line cannot go stale
-    # when the setting is changed with '+' / '-' or the flare box.
-    # 中文：转换高度是固件里的设置，串口不会告诉我们，所以从数据里推断 ——
-    #       取板子报出 FLARE NOW 的最高高度。画观测值而不是假设值，
-    #       意味着用 '+' / '-' 或输入框改了设置之后，这条线不会变成谎话。
-    flare_heights = [s.height for s in history
-                     if s.stage == 4 and math.isfinite(s.height)]
-    if flare_heights:
-        axdist.axhline(max(flare_heights), color="#d62728", linestyle="--",
-                       linewidth=1.0)
-        axdist.text(0.01, max(flare_heights), " changeover", color="#d62728",
-                    fontsize=8, va="bottom",
-                    transform=axdist.get_yaxis_transform())
+    中文说明（为什么要改成「建一次、只更新」）：
+      最早的写法每一帧都对三个面板 ax.clear()，然后从头再画一遍：箭头、文字、
+      网格、图例、参考线全部重建。2026-10-03 实测每帧 137 ms，上限只有 7 fps ——
+      这就是移动传感器时 3D 视图一顿一顿的原因。
+      这些时间几乎全花在重建「根本不会变的东西」上。现在坐标范围、轴标签、
+      网格、40° 判据线、图例这些静态部分只在开始时设置一次，
+      每一帧只改线条的数据和文字内容。
+    """
 
-    if history:
-        t_end = history[-1].t
-        ts = [s.t - t_end for s in history]
+    AXIS_COLORS = ("#d62728", "#2ca02c", "#1f77b4")     # X red, Y green, Z blue
+    AXIS_LABELS = ("+X", "+Y", "+Z")
+    BEAM_COLOR = "#ff7f0e"
+
+    def __init__(self, fig, ax3d, axtilt, axdist):
+        self.fig, self.ax3d, self.axtilt, self.axdist = fig, ax3d, axtilt, axdist
+        self._yscale_state = None
+        self._setup_banner()
+        self._setup_3d()
+        self._setup_tilt()
+        self._setup_range()
+
+    # ---------------------------------------------------------------- setup
+
+    def _setup_banner(self):
+        """One big word for what the buzzer is doing right now."""
+        self.banner = self.fig.text(0.72, 0.955, "alert: --", ha="center",
+                                    va="center", fontsize=15, family="monospace",
+                                    fontweight="bold", color="#8a8a8a")
+
+    def _setup_3d(self):
+        ax = self.ax3d
+        ax.set_xlim(-1.2, 1.2)
+        ax.set_ylim(-1.2, 1.2)
+        ax.set_zlim(-1.2, 1.2)
+        ax.set_box_aspect((1, 1, 1))
+        ax.set_xlabel("world X")
+        ax.set_ylabel("world Y")
+        ax.set_zlabel("world Z (up)")
+        # World vertical: theta is measured against this.
+        ax.plot([0, 0], [0, 0], [0, 1.15], color="0.6", linestyle=":", linewidth=1)
+
+        # Body axes as plain 3-D lines with a dot at the tip. A quiver cannot have
+        # its vectors moved after creation, so it would have to be destroyed and
+        # rebuilt every frame -- exactly the cost this class exists to avoid.
+        # 中文：机身三轴用普通 3D 线段加端点圆点。quiver 箭头创建后无法移动，
+        #       只能每帧销毁重建 —— 那正是这个类要省掉的开销。
+        self.axis_lines, self.axis_tips, self.axis_texts = [], [], []
+        for color, label in zip(self.AXIS_COLORS, self.AXIS_LABELS):
+            (line,) = ax.plot([0, 0], [0, 0], [0, 0], color=color, linewidth=2.5)
+            (tip,) = ax.plot([0], [0], [0], marker="o", markersize=6, color=color,
+                             linestyle="none")
+            text = ax.text(0, 0, 0, label, color=color, fontsize=9, ha="center")
+            self.axis_lines.append(line)
+            self.axis_tips.append(tip)
+            self.axis_texts.append(text)
+
+        # The laser fires along body -Z, so the beam is the +Z axis mirrored. Drawn
+        # at unit length regardless of the real range, which keeps it in frame and
+        # is still geometrically honest: with |beam| = 1 the tip sits exactly
+        # cos(theta) = h/d below the origin, so the dashed drop and the ground line
+        # picture the correction itself, not a to-scale map.
+        # 中文：激光沿 -Z 打出，光束就是 +Z 轴取反。一律画成单位长度：
+        #       这时光束末端相对原点的垂直落差恰好等于 cos(theta) = h/d，
+        #       那根竖直虚线和地面线画的就是「斜距换算成高度」本身。
+        c = self.BEAM_COLOR
+        (self.beam,) = ax.plot([0, 0], [0, 0], [0, 0], color=c, linewidth=2.0)
+        (self.beam_tip,) = ax.plot([0], [0], [0], marker="v", markersize=7,
+                                   color=c, linestyle="none")
+        (self.beam_drop,) = ax.plot([0, 0], [0, 0], [0, 0], color=c,
+                                    linestyle=":", linewidth=1.0)
+        (self.ground,) = ax.plot([-1.1, 1.1], [0, 0], [0, 0], color="0.5",
+                                 linestyle="--", linewidth=0.9)
+        self.beam_text = ax.text(0, 0, 0, "beam", color=c, fontsize=9, ha="center")
+        self.beam_parts = (self.beam, self.beam_tip, self.beam_drop, self.ground,
+                           self.beam_text)
+        self.title3d = ax.set_title("waiting for data...", fontsize=10,
+                                    family="monospace")
+
+    def _setup_tilt(self):
+        ax = self.axtilt
+        ax.set_ylim(0, 180)
+        ax.set_xlim(-TRAIL_SECONDS, 0.5)
+        ax.set_ylabel("theta from vertical (deg)")
+        ax.grid(alpha=0.3)
+        # Above this the laser points sideways and cos-correction is invalid.
+        ax.axhline(TILT_GATE_DEG, color="#d62728", linestyle="--", linewidth=1)
+        ax.text(0.01, TILT_GATE_DEG + 3, "40deg reject gate", color="#d62728",
+                fontsize=8, transform=ax.get_yaxis_transform())
+        (self.tilt_line,) = ax.plot([], [], color="#1f77b4", linewidth=1.4)
+        ax.set_title("theta history -- feeds h = d x cos(theta)", fontsize=10)
+
+    def _setup_range(self):
+        ax = self.axdist
+        ax.set_xlim(-TRAIL_SECONDS, 0.5)
+        ax.set_xlabel("seconds")
+        # The stage boundaries the firmware actually uses (alert_engine
+        # stageForHeight). A reference line that is wrong is worse than none,
+        # because it invites you to check against it.
+        # 中文：固件真正在用的档位边界。画错的参考线比没有更糟，因为它会诱使你去核对。
+        for edge in (1000.0, 500.0):
+            ax.axhline(edge, color="0.75", linestyle=":", linewidth=0.8)
+
+        # The changeover height is inferred from the data -- the highest height
+        # at which the board reported FLARE NOW -- so it cannot go stale when the
+        # setting is changed with '+' / '-' or the flare box. Hidden until seen.
+        # 中文：转换高度从数据里推断（板子报出 FLARE NOW 的最高高度），
+        #       改了设置之后这条线也不会变成谎话。没观测到之前隐藏。
+        self.changeover = ax.axhline(0, color="#d62728", linestyle="--",
+                                     linewidth=1.0, visible=False)
+        self.changeover_text = ax.text(0.01, 0, " changeover", color="#d62728",
+                                       fontsize=8, va="bottom", visible=False,
+                                       transform=ax.get_yaxis_transform())
+
         # NaN gaps are the point: a dropped echo must read as absent, not as low.
-        axdist.plot(ts, [s.dist for s in history], color="#7f7f7f",
-                    linewidth=1.0, label="d slant range")
-        axdist.plot(ts, [s.height for s in history], color="#ff7f0e",
-                    linewidth=1.8, label="h vertical")
-        axdist.set_xlim(-TRAIL_SECONDS, 0.5)
-        axdist.legend(loc="upper left", fontsize=8, framealpha=0.85)
+        (self.d_line,) = ax.plot([], [], color="#7f7f7f", linewidth=1.0,
+                                 label="d slant range")
+        (self.h_line,) = ax.plot([], [], color=self.BEAM_COLOR, linewidth=1.8,
+                                 label="h vertical")
+        ax.legend(loc="upper left", fontsize=8, framealpha=0.85)
+        self.range_title = ax.set_title("range: no data", fontsize=11,
+                                        color="#d62728", family="monospace")
+        self._apply_yscale(("linear", 0.0, PLOT_MIN_CEILING_CM))
 
-    if latest is None or not math.isfinite(latest.dist):
-        # Distinguish "the laser is not talking to us" from "it is talking but
-        # sees nothing usable" -- different wiring problems, different fixes.
-        why = "no data" if latest is None else (
-            "laser OFFLINE" if latest.strength == 0 else
-            f"no echo (strength {latest.strength})")
-        axdist.set_title(f"range: {why}", fontsize=11, color="#d62728",
-                         family="monospace")
-        return
+    def _apply_yscale(self, state):
+        # set_yscale rebuilds the axis' locators and is far from free, so it only
+        # runs when the ladder actually moves to another rung.
+        # 中文：set_yscale 会重建刻度定位器，开销不小，只在档位真的变化时才调用。
+        if state == self._yscale_state:
+            return
+        scale, lo, hi = state
+        ax = self.axdist
+        if self._yscale_state is None or self._yscale_state[0] != scale:
+            ax.set_yscale(scale)
+            ax.set_ylabel("cm" + (" (log)" if scale == "log" else ""))
+            ax.grid(False, which="both")
+            ax.grid(alpha=0.3, which="both" if scale == "log" else "major")
+        ax.set_ylim(lo, hi)
+        self._yscale_state = state
 
-    # With the correction off the firmware returns the raw slant range as height,
-    # so h and d sit on top of each other. Say so on the title: two identical
-    # traces are otherwise indistinguishable from "the unit happens to be level",
-    # which is exactly the wrong thing to conclude.
-    # 中文：关掉修正时固件直接把斜距当高度返回，于是 h 和 d 两条线完全重合。
-    #       必须在标题里写明白 —— 否则「两条线重合」看起来和「设备正好是水平的」
-    #       一模一样，而这恰恰是最不该得出的结论。
-    gated = latest.tilt > TILT_GATE_DEG and latest.corr
-    if not latest.corr:
-        note, color = "   [NO TILT CORR: h = d]", "#b34700"
-    elif gated:
-        note, color = "   [TILT GATED]", "#d62728"
-    else:
-        note, color = "", "#333333"
-    axdist.set_title(
-        f"h = {latest.height / 100.0:5.2f} m   (d = {latest.dist / 100.0:5.2f} m,"
-        f" S = {latest.strength}){note}",
-        fontsize=11, color=color, family="monospace")
+    # --------------------------------------------------------------- update
+
+    def update(self, latest: Sample | None, history: list[Sample]):
+        self._update_banner(latest)
+        self._update_3d(latest)
+        self._update_tilt(history)
+        self._update_range(latest, history)
+
+    def _update_banner(self, latest):
+        if latest is None:
+            self.banner.set_text("alert: --")
+            self.banner.set_color("#8a8a8a")
+            return
+        stage = max(0, min(len(STAGE_NAMES) - 1, latest.stage))
+        self.banner.set_text(f"alert: {STAGE_NAMES[stage]}")
+        self.banner.set_color(STAGE_COLORS[stage])
+
+    def _update_3d(self, latest):
+        if latest is None:
+            self.title3d.set_text("waiting for data...")
+            return
+        R = quat_to_matrix(*latest.quat)
+        for i in range(3):
+            vx, vy, vz = R[:, i]
+            self.axis_lines[i].set_data_3d([0, vx], [0, vy], [0, vz])
+            self.axis_tips[i].set_data_3d([vx], [vy], [vz])
+            self.axis_texts[i].set_position_3d((vx * 1.18, vy * 1.18, vz * 1.18))
+
+        has_beam = math.isfinite(latest.dist)
+        for part in self.beam_parts:
+            part.set_visible(has_beam)
+        if has_beam:
+            bx, by, bz = -R[:, 2]
+            drop = -math.cos(math.radians(latest.tilt))      # tip height = h/d
+            self.beam.set_data_3d([0, bx], [0, by], [0, bz])
+            self.beam_tip.set_data_3d([bx], [by], [bz])
+            self.beam_drop.set_data_3d([bx, bx], [by, by], [bz, drop])
+            self.ground.set_data_3d([-1.1, 1.1], [0, 0], [drop, drop])
+            self.beam_text.set_position_3d((bx * 1.1, by * 1.1, bz * 1.1))
+
+        roll, pitch, yaw = latest.rpy
+        self.title3d.set_text(
+            f"tilt theta = {latest.tilt:5.1f}deg    fusion: {ACC_NAMES[latest.acc & 3]}\n"
+            f"roll {roll:+6.1f}  pitch {pitch:+6.1f}  yaw {yaw:+6.1f}")
+
+    def _update_tilt(self, history):
+        if not history:
+            self.tilt_line.set_data([], [])
+            return
+        t_end = history[-1].t
+        self.tilt_line.set_data([s.t - t_end for s in history],
+                                [s.tilt for s in history])
+
+    def _update_range(self, latest, history):
+        self._apply_yscale(_range_ylimits(history))
+
+        if history:
+            t_end = history[-1].t
+            ts = [s.t - t_end for s in history]
+            self.d_line.set_data(ts, [s.dist for s in history])
+            self.h_line.set_data(ts, [s.height for s in history])
+        else:
+            self.d_line.set_data([], [])
+            self.h_line.set_data([], [])
+
+        flare_heights = [s.height for s in history
+                         if s.stage == 4 and math.isfinite(s.height)]
+        seen = bool(flare_heights)
+        self.changeover.set_visible(seen)
+        self.changeover_text.set_visible(seen)
+        if seen:
+            top = max(flare_heights)
+            self.changeover.set_ydata([top, top])
+            self.changeover_text.set_y(top)
+
+        if latest is None or not math.isfinite(latest.dist):
+            # "Not talking to us" and "talking but sees nothing usable" are
+            # different wiring problems with different fixes.
+            # 中文：「激光没和我们说话」和「说话了但没看到可用回波」是两种不同的
+            #       接线问题，修法也不同，必须分开显示。
+            why = "no data" if latest is None else (
+                "laser OFFLINE" if latest.strength == 0 else
+                f"no echo (strength {latest.strength})")
+            self.range_title.set_text(f"range: {why}")
+            self.range_title.set_color("#d62728")
+            return
+
+        # With the correction off the firmware returns the raw slant range as
+        # height, so h and d coincide -- which otherwise looks exactly like "the
+        # unit happens to be level", the wrong conclusion. Say so in the title.
+        # 中文：修正关掉时 h 和 d 完全重合，看起来和「设备正好水平」一模一样 ——
+        #       这恰恰是最不该得出的结论，所以标题里必须写明。
+        gated = latest.tilt > TILT_GATE_DEG and latest.corr
+        if not latest.corr:
+            note, color = "   [NO TILT CORR: h = d]", "#b34700"
+        elif gated:
+            note, color = "   [TILT GATED]", "#d62728"
+        else:
+            note, color = "", "#333333"
+        self.range_title.set_text(
+            f"h = {latest.height / 100.0:5.2f} m   (d = {latest.dist / 100.0:5.2f} m,"
+            f" S = {latest.strength}){note}")
+        self.range_title.set_color(color)
+
+
+    def dynamic_artists(self) -> list:
+        """Everything update() changes. The rest of the figure is static."""
+        return [self.banner, self.title3d, *self.axis_lines, *self.axis_tips,
+                *self.axis_texts, *self.beam_parts, self.tilt_line,
+                self.changeover, self.changeover_text, self.d_line, self.h_line,
+                self.range_title]
+
+
+class Blitter:
+    """Repaint only the moving artists over a cached picture of everything else.
+
+    Rebuilding the artists instead of clearing the axes took a frame from 137 ms
+    to 87 ms, still only 11 fps. Profiling showed why: each panel spends 20-33 ms
+    re-rendering its own tick labels, grid and axis text, which do not change
+    between frames either. So the figure is rendered in full once, that picture is
+    kept, and a frame restores it and draws just the dynamic artists on top.
+
+    A full redraw still happens whenever something static changes: the y-scale
+    rung, a button label, the test-runner status text. The caller detects that and
+    asks for one with draw_idle(); the draw_event it fires recaptures the
+    background. Window resizes and mouse-rotating the 3-D view go through the same
+    draw_event, so they are covered without any special case.
+
+    中文说明（为什么还要再加一层 blit）：
+      光是「建一次、只更新」只把每帧从 137 ms 降到 87 ms，还是只有 11 fps。
+      剖析发现：每个面板每帧仍要花 20~33 ms 重新渲染自己的刻度数字、网格和轴标签，
+      而这些东西帧与帧之间同样不变。所以先完整渲染一次，把这张图存下来，
+      之后每帧只把它贴回去，再在上面画那几根会动的线和几行会变的字。
+      静态部分真的变了（纵轴换档、按钮文字、测试状态栏）时，调用方用 draw_idle()
+      要一次完整重绘，重绘触发的 draw_event 会重新截取背景。
+      拖动窗口大小、用鼠标转 3D 视角也走同一个 draw_event，不需要单独处理。
+    """
+
+    def __init__(self, fig, artists):
+        self.fig = fig
+        self.canvas = fig.canvas
+        self.artists = artists
+        self.background = None
+        for a in artists:
+            a.set_animated(True)
+        self._cid = self.canvas.mpl_connect("draw_event", self._on_draw)
+
+    def _on_draw(self, _event):
+        self.background = self.canvas.copy_from_bbox(self.fig.bbox)
+        self._draw_artists()
+
+    def _draw_artists(self):
+        for a in self.artists:
+            self.fig.draw_artist(a)
+
+    def blit(self):
+        if self.background is None:
+            self.canvas.draw_idle()        # first frame: nothing cached yet
+            return
+        self.canvas.restore_region(self.background)
+        self._draw_artists()
+        self.canvas.blit(self.fig.bbox)
 
 
 def draw_frame(ax3d, axtilt, axdist, latest: Sample | None, history: list[Sample]):
-    ax3d.clear()
-    axtilt.clear()
-    axdist.clear()
-    _draw_3d(ax3d, latest)
-    _draw_tilt(axtilt, history)
-    _draw_range(axdist, latest, history)
-    _draw_stage_banner(ax3d.figure, latest)
+    # The view is parked on the figure so every caller -- the live loop and the
+    # headless --selftest -- shares one set of artists per figure.
+    # 中文：LiveView 挂在 figure 上，实时窗口和无界面的 --selftest 共用同一套图元。
+    fig = ax3d.figure
+    view = getattr(fig, "_flare_view", None)
+    if view is None:
+        view = LiveView(fig, ax3d, axtilt, axdist)
+        fig._flare_view = view
+    view.update(latest, history)
 
 
 def ensure_gui_backend() -> None:
@@ -786,7 +979,6 @@ def run_live(buf: SampleBuffer, stop: threading.Event, interval_ms: int,
              replay_items=None, replay_result=None):
     ensure_gui_backend()
     import matplotlib.pyplot as plt
-    from matplotlib.animation import FuncAnimation
     from matplotlib.widgets import Button, RadioButtons, TextBox
 
     fig, ax3d, axtilt, axdist = build_figure()
@@ -1042,21 +1234,48 @@ def run_live(buf: SampleBuffer, stop: threading.Event, interval_ms: int,
     if replay_items:
         start_run(replay_items, replay_result if replay_result is not None else [])
 
-    def update(_frame):
+    view = LiveView(fig, ax3d, axtilt, axdist)
+    fig._flare_view = view
+    blitter = Blitter(fig, view.dynamic_artists())
+
+    # Everything static that can still change. When this differs from the last
+    # frame, the cached background is out of date and a full redraw is due.
+    # 中文：所有「静态但仍可能变」的东西。和上一帧不同时，缓存的背景已经过期，
+    #       需要完整重绘一次。
+    def static_signature():
+        return (view._yscale_state, status_txt.get_text(),
+                btn_corr.label.get_text(), btn_yscale.label.get_text(),
+                btn_run.label.get_text())
+
+    last_sig = {"sig": None}
+
+    def tick():
         latest, history = buf.snapshot()
-        draw_frame(ax3d, axtilt, axdist, latest, history)
+        view.update(latest, history)
         if latest is not None and latest.corr != corr_state["on"]:
             corr_state["on"] = latest.corr
             btn_corr.label.set_text(f"tilt corr: {'ON' if latest.corr else 'OFF'}")
             btn_corr.label.set_color("#1a7f37" if latest.corr else "#b34700")
-        return []
+        sig = static_signature()
+        if sig != last_sig["sig"]:
+            last_sig["sig"] = sig
+            fig.canvas.draw_idle()
+        else:
+            blitter.blit()
 
-    # cache_frame_data=False: this is an open-ended live stream, not a fixed
-    # sequence, so matplotlib must not try to cache frames.
-    # The reference is parked on the figure because a local would be garbage
-    # collected the moment show() returns, killing the animation.
-    fig._flare_anim = FuncAnimation(fig, update, interval=interval_ms,
-                                    cache_frame_data=False)
+    # A plain timer rather than FuncAnimation: without blit, FuncAnimation forces
+    # a full draw every frame, which is the cost being removed; with blit=True it
+    # only repaints inside each axes' box, which misses the titles above them.
+    # Parked on the figure because a local would be garbage collected the moment
+    # show() returns, and the timer would silently stop.
+    # 中文：用普通定时器而不是 FuncAnimation：不开 blit 时它每帧强制完整重绘，
+    #       正是要省掉的开销；开了 blit=True 它只重画每个 axes 方框以内，
+    #       方框上方的标题就不更新了。
+    #       定时器挂在 figure 上，否则 show() 一返回局部变量就被回收，定时器无声停止。
+    timer = fig.canvas.new_timer(interval=interval_ms)
+    timer.add_callback(tick)
+    timer.start()
+    fig._flare_timer = timer
     # Same reason as the animation: a widget with no strong reference is garbage
     # collected and its callbacks stop firing.
     fig._flare_btns = (btn_reset, btn_corr, btn_yscale, btn_run, radio,
@@ -1209,11 +1428,13 @@ def check_replay(buf: SampleBuffer, meta: dict, complete: bool) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--port", default="COM4", help="serial port (default COM4)")
+    ap.add_argument("--port", default="COM7",
+                    help="serial port (default COM7, the XIAO; the bench board is COM4)")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--demo", action="store_true",
                     help="synthetic motion instead of real hardware")
-    ap.add_argument("--fps", type=int, default=25, help="redraw rate")
+    ap.add_argument("--fps", type=int, default=40,
+                    help="redraw rate (default 40; a frame costs ~19 ms, so ~50 is the ceiling)")
     ap.add_argument("--selftest", metavar="PNG",
                     help="render a single frame headless and exit")
     ap.add_argument("--replay", metavar="CSV", nargs="+",

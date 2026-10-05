@@ -1,8 +1,8 @@
 # Launch the BNO08x live attitude viewer.
 #
-#   .\tools\viewer.ps1              # read the board on COM4
+#   .\tools\viewer.ps1              # read the XIAO on COM7
 #   .\tools\viewer.ps1 --demo       # synthetic motion, no hardware needed
-#   .\tools\viewer.ps1 --port COM7
+#   .\tools\viewer.ps1 --port COM4  # the bench board
 #   .\tools\viewer.ps1 --replay tools\mock_descent_20m.csv
 #                                   # feed a mock 20 m descent to the board as
 #                                   # laser frames, watch the graph, then check
